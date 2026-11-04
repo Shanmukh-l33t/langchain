@@ -666,8 +666,20 @@ def _create_message_from_message_type(
             kwargs["example"] = example
         message: BaseMessage = HumanMessage(content=content, **kwargs)
     elif message_type in {"ai", "assistant"}:
-        if example := kwargs.get("additional_kwargs", {}).pop("example", False):
+        ai_additional_kwargs = kwargs.get("additional_kwargs", {})
+        if example := ai_additional_kwargs.pop("example", False):
             kwargs["example"] = example
+        # First-class `AIMessage` fields that arrive here via model_dump()
+        # round-trips must be restored as real fields, not left inside
+        # `additional_kwargs` (see #41675, same pattern as `status` in #32840).
+        if (
+            usage_metadata := ai_additional_kwargs.pop("usage_metadata", None)
+        ) is not None:
+            kwargs["usage_metadata"] = usage_metadata
+        if (
+            invalid_tool_calls := ai_additional_kwargs.pop("invalid_tool_calls", None)
+        ) is not None:
+            kwargs["invalid_tool_calls"] = invalid_tool_calls
         message = AIMessage(content=content, **kwargs)
     elif message_type in {"system", "developer"}:
         if message_type == "developer":

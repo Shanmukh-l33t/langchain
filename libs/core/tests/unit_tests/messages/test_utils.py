@@ -15,6 +15,7 @@ from langchain_core.messages import (
     ChatMessage,
     FunctionMessage,
     HumanMessage,
+    InvalidToolCall,
     SystemMessage,
     ToolCall,
     ToolMessage,
@@ -3170,3 +3171,73 @@ def test_convert_to_messages_lc_envelope_partial_shape_not_matched() -> None:
     # and dict `kwargs` too. Without all four, we fall through.
     with pytest.raises(ValueError, match="MESSAGE_COERCION_FAILURE"):
         convert_to_messages([{"lc": 1, "content": "missing other fields"}])
+
+
+def test_convert_to_messages_preserves_usage_metadata() -> None:
+    """Regression test for #41675.
+
+    `AIMessage.model_dump()` output fed back through `convert_to_messages`
+    must restore `usage_metadata` on the message instead of leaving it
+    buried in `additional_kwargs`.
+    """
+    usage = {"input_tokens": 3, "output_tokens": 5, "total_tokens": 8}
+    msg = AIMessage("hi", usage_metadata=usage)
+
+    [revived] = convert_to_messages([msg.model_dump()])
+
+    assert isinstance(revived, AIMessage)
+    assert revived.usage_metadata == usage
+    assert "usage_metadata" not in revived.additional_kwargs
+    assert revived.model_dump() == msg.model_dump()
+
+
+def test_convert_to_messages_preserves_invalid_tool_calls() -> None:
+    """Regression test for #41675.
+
+    Same as above but for `invalid_tool_calls`.
+    """
+    invalid: list[InvalidToolCall] = [
+        {
+            "name": "get_weather",
+            "args": '{"location": "Paris"',  # truncated JSON string
+            "id": "call_1",
+            "type": "invalid_tool_call",
+            "error": "Could not parse tool arguments",
+        }
+    ]
+    msg = AIMessage("hi", invalid_tool_calls=invalid)
+
+    [revived] = convert_to_messages([msg.model_dump()])
+
+    assert isinstance(revived, AIMessage)
+    assert revived.invalid_tool_calls == invalid
+    assert "invalid_tool_calls" not in revived.additional_kwargs
+    assert revived.model_dump() == msg.model_dump()
+
+
+def test_convert_to_messages_preserves_both_fields_together() -> None:
+    """Regression test for #41675: both fields plus existing additional_kwargs."""
+    usage = {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3}
+    invalid: list[InvalidToolCall] = [
+        {
+            "name": "foo",
+            "args": "{",
+            "id": "call_9",
+            "type": "invalid_tool_call",
+            "error": "bad",
+        }
+    ]
+    msg = AIMessage(
+        "hi",
+        usage_metadata=usage,
+        invalid_tool_calls=invalid,
+        additional_kwargs={"custom": "keepme"},
+    )
+
+    [revived] = convert_to_messages([msg.model_dump()])
+
+    assert isinstance(revived, AIMessage)
+    assert revived.usage_metadata == usage
+    assert revived.invalid_tool_calls == invalid
+    assert revived.additional_kwargs == {"custom": "keepme"}
+    assert revived.model_dump() == msg.model_dump()
