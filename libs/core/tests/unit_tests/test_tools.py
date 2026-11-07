@@ -23,7 +23,9 @@ from typing import (
     cast,
     get_type_hints,
 )
+from uuid import uuid4
 
+import anyio
 import pytest
 from pydantic import (
     AliasChoices,
@@ -1276,6 +1278,105 @@ async def test_async_tool_cancellation_calls_on_tool_error() -> None:
 
     assert len(handler.tool_errors) == 1
     assert isinstance(handler.tool_errors[0], asyncio.CancelledError)
+
+
+class _SuspendingToolCaptureHandler(BaseCallbackHandler):
+    """Capture tool end/error events, suspending once before recording.
+
+    The suspension before recording makes the regression test deterministic:
+    inside a cancelled anyio scope the unshielded callback coroutine is
+    cancelled at its first suspension point, while a ``@shielded`` callback
+    runs to completion in its own task.
+    """
+
+    def __init__(self) -> None:
+        self.tool_ends = 0
+        self.tool_errors: list[BaseException] = []
+
+    @override
+    async def on_tool_end(
+        self,
+        output: Any,
+        *,
+        run_id: Any,
+        parent_run_id: Any | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        await asyncio.sleep(0)
+        self.tool_ends += 1
+
+    @override
+    async def on_tool_error(
+        self,
+        error: BaseException,
+        *,
+        run_id: Any,
+        parent_run_id: Any | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        await asyncio.sleep(0)
+        self.tool_errors.append(error)
+
+
+async def test_cancel_scope_tool_cancellation_calls_on_tool_error() -> None:
+    """A tool cancelled from an anyio cancel scope still closes the run.
+
+    Unlike `asyncio.Task.cancel()`, an anyio cancel scope (what Starlette and
+    FastAPI use on client disconnects) re-raises on every `await`. The async
+    tool-run end/error callbacks were the only run-manager callbacks not
+    wrapped in `@shielded`, so the cancellation cut the callback off
+    mid-flight and the tool run stayed open with neither `on_tool_end` nor
+    `on_tool_error`.
+
+    See https://github.com/langchain-ai/langchain/issues/41744.
+    """
+    started = asyncio.Event()
+
+    @tool
+    async def slow_tool() -> str:
+        """Wait until cancelled."""
+        started.set()
+        await asyncio.Event().wait()
+        return "unreachable"
+
+    handler = _SuspendingToolCaptureHandler()
+    scopes: list[anyio.CancelScope] = []
+
+    async def invoke_in_scope() -> None:
+        with anyio.CancelScope() as scope:
+            scopes.append(scope)
+            await slow_tool.ainvoke({}, config={"callbacks": [handler]})
+
+    task = asyncio.create_task(invoke_in_scope())
+    await started.wait()
+    scopes[0].cancel()
+    # the scope absorbs its own cancellation, so the task finishes normally
+    await task
+
+    # `@shielded` `on_tool_error` runs in its own task and may still be
+    # draining after the cancelled task returns; yield so it can finish.
+    await asyncio.sleep(0.05)
+    assert len(handler.tool_errors) == 1
+    assert isinstance(handler.tool_errors[0], asyncio.CancelledError)
+    assert handler.tool_ends == 0
+
+
+async def test_cancel_scope_still_publishes_shielded_tool_end() -> None:
+    """`on_tool_end` publishes even when the scope is cancelled before it."""
+    handler = _SuspendingToolCaptureHandler()
+    manager = AsyncCallbackManagerForToolRun(
+        run_id=uuid4(),
+        handlers=[handler],
+        inheritable_handlers=[handler],
+    )
+    with anyio.CancelScope() as scope:
+        scope.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await manager.on_tool_end("output")
+
+    # the shielded callback keeps running in its own task; let it drain
+    await asyncio.sleep(0.05)
+    assert handler.tool_ends == 1
 
 
 def test_optional_subset_model_rewrite() -> None:
